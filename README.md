@@ -84,14 +84,16 @@ curl -N http://127.0.0.1:8010/internal/agents/chat/run \
 
 ## Agent 创建方式
 
-`src/app/agent/factory.py` 是唯一 Agent 组合根，直接使用 Deep Agents 创建当前应用的 Agent：
+`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，并按经过
+`lower_snake_case` 校验的 `agent_id` 加载 Build 生成的 `app.agent.<agent_id>` 模块。
+业务模块必须公开固定入口：
 
 ```python
 from deepagents import create_deep_agent
 
 
-def create_agent(*, agent_id, model, runtime_context, checkpointer):
-    """使用 Deep Agents 创建当前应用的智能体。"""
+def create_agent(*, model, runtime_context, checkpointer):
+    """使用模板注入的模型、可信上下文和 checkpoint 创建业务智能体。"""
 
     return create_deep_agent(
         model=model,
@@ -101,7 +103,9 @@ def create_agent(*, agent_id, model, runtime_context, checkpointer):
     )
 ```
 
-模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。后续生成的 Prompt、工具和业务能力继续在 `src/app/agent/` 与 `src/app/tools/` 内扩展，不在项目根目录建立第二套 Agent 代码树，也不得从请求体读取模型密钥、Provider、用户身份或权限范围。
+模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。业务模块不得再次初始化模型。后续生成的 Prompt、工具和业务能力继续在 `src/app/agent/` 与 `src/app/tools/` 内扩展，不在项目根目录建立第二套 Agent 代码树，也不得从请求体读取模型密钥、Provider、用户身份或权限范围。
+
+业务 Tool 只允许调用 Agent Contract 已展开的 Java Endpoint。Java 内部地址和服务凭据分别来自 `AGENT_RUNTIME_BACKEND_BASE_URL` 与 `AGENT_RUNTIME_TOOL_GATEWAY_TOKEN`；生成代码只能通过 `RuntimeSettings.require_backend_base_url()` 和 `require_tool_gateway_token()` 读取，不能把值写入源码、Contract、日志或模型输出。用户、租户、Scope 和 Trace 只能从模板校验后的 `RuntimeContext` 转发。
 
 当业务 Agent 需要澄清或确认时，LangGraph interrupt value 必须符合：
 

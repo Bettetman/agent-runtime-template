@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -116,6 +117,31 @@ def test_runtime_context_requires_internal_gateway_token(tmp_path) -> None:
     assert context.scopes == ("chat", "inventory")
 
 
+def test_tool_gateway_settings_require_safe_origin_and_token(tmp_path) -> None:
+    """验证业务 Tool 只能读取安全 Java Origin 和独立内部凭据。"""
+
+    settings = _settings(tmp_path)
+    with pytest.raises(RuntimeError, match="BACKEND_BASE_URL"):
+        settings.require_backend_base_url()
+    with pytest.raises(RuntimeError, match="TOOL_GATEWAY_TOKEN"):
+        settings.require_tool_gateway_token()
+
+    configured = replace(
+        settings,
+        backend_base_url="http://127.0.0.1:8080/",
+        tool_gateway_token="tool-token",
+    )
+    assert configured.require_backend_base_url() == "http://127.0.0.1:8080"
+    assert configured.require_tool_gateway_token() == "tool-token"
+
+    unsafe = replace(
+        settings,
+        backend_base_url="https://user:password@example.com/api",
+    )
+    with pytest.raises(RuntimeError, match="BACKEND_BASE_URL"):
+        unsafe.require_backend_base_url()
+
+
 @pytest.mark.asyncio
 async def test_model_factory_creates_streaming_project_default_model(tmp_path) -> None:
     """验证模型工厂通过 init_chat_model 创建支持流式输出的模型。"""
@@ -174,6 +200,43 @@ def test_agent_factory_rejects_unknown_agent() -> None:
     with pytest.raises(RuntimeRequestError) as error:
         validate_agent_id("inventory_assistant")
     assert error.value.code == "agent_not_found"
+
+
+def test_agent_factory_loads_generated_business_agent() -> None:
+    """验证合法业务 Agent ID 会路由到 Build 生成的固定创建入口。"""
+
+    generated_agent = object()
+    generated_factory = Mock(return_value=generated_agent)
+    module = SimpleNamespace(create_agent=generated_factory)
+    model = object()
+    checkpointer = object()
+    context = _context()
+    with patch("app.agent.factory.import_module", return_value=module) as importer:
+        agent = create_agent(
+            agent_id="inventory_assistant",
+            model=model,
+            runtime_context=context,
+            checkpointer=checkpointer,
+        )
+
+    assert agent is generated_agent
+    generated_factory.assert_called_once_with(
+        model=model,
+        runtime_context=context,
+        checkpointer=checkpointer,
+    )
+    importer.assert_called_with("app.agent.inventory_assistant")
+
+
+def test_agent_factory_rejects_generated_module_without_entry() -> None:
+    """验证业务模块缺少固定 create_agent 入口时返回安全错误。"""
+
+    with (
+        patch("app.agent.factory.import_module", return_value=SimpleNamespace()),
+        pytest.raises(RuntimeRequestError) as error,
+    ):
+        validate_agent_id("inventory_assistant")
+    assert error.value.code == "invalid_agent_module"
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -28,6 +29,8 @@ class RuntimeSettings:
     model_max_retries: int
     model_temperature: float
     model_max_tokens: int
+    backend_base_url: str = ""
+    tool_gateway_token: str = ""
 
     @property
     def checkpoint_db_path(self) -> Path:
@@ -55,6 +58,30 @@ class RuntimeSettings:
         ]
         if missing:
             raise RuntimeError("缺少模型环境变量：" + "、".join(missing) + "。")
+
+    def require_backend_base_url(self) -> str:
+        """返回只含 HTTP(S) Origin 的 Java Backend 内部地址。"""
+
+        value = self.backend_base_url.rstrip("/")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+        ):
+            raise RuntimeError("AGENT_RUNTIME_BACKEND_BASE_URL 配置无效。")
+        return value
+
+    def require_tool_gateway_token(self) -> str:
+        """返回 Runtime 调用 Java Tool Gateway 使用的内部凭据。"""
+
+        if not self.tool_gateway_token:
+            raise RuntimeError("缺少 AGENT_RUNTIME_TOOL_GATEWAY_TOKEN。")
+        return self.tool_gateway_token
 
 
 def _positive_int(name: str, default: str) -> int:
@@ -114,6 +141,8 @@ def load_settings() -> RuntimeSettings:
         model_max_retries=_non_negative_int("MODEL_MAX_RETRIES", "2"),
         model_temperature=float(os.getenv("AGENT_TEMPERATURE", "0.2")),
         model_max_tokens=_positive_int("AGENT_MAX_TOKENS", "4096"),
+        backend_base_url=os.getenv("AGENT_RUNTIME_BACKEND_BASE_URL", "").strip(),
+        tool_gateway_token=os.getenv("AGENT_RUNTIME_TOOL_GATEWAY_TOKEN", "").strip(),
     )
 
 
