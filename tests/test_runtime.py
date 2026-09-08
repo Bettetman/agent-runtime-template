@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessageChunk
 
 from app.agent.context import RuntimeContext, RuntimeContextError, create_runtime_context
+from app.agent.definition import AgentDefinition
 from app.agent.factory import create_agent, validate_agent_id
 from app.interaction.schemas import PendingInteraction, RuntimeRequestError, parse_run_request
 from app.interaction.service import InteractionOutcome, TextDelta, stream_agent_interaction
@@ -202,8 +203,63 @@ def test_agent_factory_rejects_unknown_agent() -> None:
     assert error.value.code == "agent_not_found"
 
 
-def test_agent_factory_loads_generated_business_agent() -> None:
-    """验证合法业务 Agent ID 会路由到 Build 生成的固定创建入口。"""
+def _business_definition(*, extension: bool = False) -> AgentDefinition:
+    """构造包含七模块状态的严格业务 Agent Definition。"""
+
+    settings = {
+        "prompt": {},
+        "model": {"generation": {"temperature": 0.25}},
+        "memory": {"shortTerm": {"enabled": True}},
+        "tools": {"enabled": False, "bindings": []},
+        "skills": {"enabled": False},
+        "knowledge": {"enabled": False},
+        "context": {},
+    }
+    modules = {
+        name: {"status": "completed" if name not in {"tools", "skills", "knowledge"} else "skipped", "configSha256": "sha256:" + "0" * 64, "reason": None}
+        for name in settings
+    }
+    return AgentDefinition.model_validate({
+        "schemaVersion": "agent-runtime.definition.v1",
+        "agentId": "inventory_assistant",
+        "source": {"contractSha256": "sha256:" + "1" * 64},
+        "identity": {},
+        "capabilities": [],
+        "interaction": {},
+        "agentSettings": settings,
+        "invocation": {},
+        "runtime": {},
+        "security": {},
+        "evaluation": {},
+        "compiledPrompt": "你是库存助手。",
+        "extension": {"enabled": extension, "module": "app.extensions.inventory_assistant" if extension else None, "path": "agent-runtime/src/app/extensions/inventory_assistant.py" if extension else None, "testPath": None},
+        "modules": modules,
+    })
+
+
+def test_agent_factory_loads_declarative_business_agent() -> None:
+    """验证标准业务 Agent 直接由 Definition 和 Generic Factory 组装。"""
+
+    model = Mock()
+    bound_model = object()
+    model.bind.return_value = bound_model
+    checkpointer = object()
+    context = _context()
+    with (
+        patch("app.agent.factory.load_agent_definition", return_value=_business_definition()),
+        patch("app.agent.factory.create_deep_agent", return_value=object()) as creator,
+    ):
+        agent = create_agent(agent_id="inventory_assistant", model=model, runtime_context=context, checkpointer=checkpointer)
+
+    assert agent is creator.return_value
+    assert creator.call_args.kwargs["model"] is bound_model
+    assert creator.call_args.kwargs["tools"] == []
+    assert creator.call_args.kwargs["system_prompt"] == "你是库存助手。"
+    assert creator.call_args.kwargs["checkpointer"] is checkpointer
+
+
+def test_agent_factory_loads_explicit_extension() -> None:
+    """验证只有 Definition 显式启用时才加载 Python Extension。"""
 
     generated_agent = object()
     generated_factory = Mock(return_value=generated_agent)
@@ -211,7 +267,10 @@ def test_agent_factory_loads_generated_business_agent() -> None:
     model = object()
     checkpointer = object()
     context = _context()
-    with patch("app.agent.factory.import_module", return_value=module) as importer:
+    with (
+        patch("app.agent.factory.load_agent_definition", return_value=_business_definition(extension=True)),
+        patch("app.agent.factory.import_module", return_value=module) as importer,
+    ):
         agent = create_agent(
             agent_id="inventory_assistant",
             model=model,
@@ -221,22 +280,25 @@ def test_agent_factory_loads_generated_business_agent() -> None:
 
     assert agent is generated_agent
     generated_factory.assert_called_once_with(
+        definition=_business_definition(extension=True),
         model=model,
+        tools=[],
         runtime_context=context,
         checkpointer=checkpointer,
     )
-    importer.assert_called_with("app.agent.inventory_assistant")
+    importer.assert_called_with("app.extensions.inventory_assistant")
 
 
 def test_agent_factory_rejects_generated_module_without_entry() -> None:
     """验证业务模块缺少固定 create_agent 入口时返回安全错误。"""
 
     with (
+        patch("app.agent.factory.load_agent_definition", return_value=_business_definition(extension=True)),
         patch("app.agent.factory.import_module", return_value=SimpleNamespace()),
         pytest.raises(RuntimeRequestError) as error,
     ):
         validate_agent_id("inventory_assistant")
-    assert error.value.code == "invalid_agent_module"
+    assert error.value.code == "invalid_agent_extension"
 
 
 @pytest.mark.asyncio
