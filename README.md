@@ -84,23 +84,30 @@ curl -N http://127.0.0.1:8010/internal/agents/chat/run \
 
 ## Agent 创建方式
 
-`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，并按经过
-`lower_snake_case` 校验的 `agent_id` 加载 Build 生成的 `app.agent.<agent_id>` 模块。
-业务模块必须公开固定入口：
+`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，并通过当前
+应用内的 Builder 注册表解析 `agent_id`，不要求每个业务 Agent 固定生成一个同名文件。
+简单业务 Agent 优先在现有组合根中增加 Builder：
 
 ```python
 from deepagents import create_deep_agent
 
 
-def create_agent(*, model, runtime_context, checkpointer):
-    """使用模板注入的模型、可信上下文和 checkpoint 创建业务智能体。"""
+def create_inventory_assistant(*, model, runtime_context, checkpointer):
+    """使用模板注入的能力创建库存助手。"""
 
+    del runtime_context
     return create_deep_agent(
         model=model,
         tools=[],
-        system_prompt="你是一个代码专家，擅长写 Python 脚本。",
+        system_prompt="你是库存管理助手，负责查询和解释库存信息。",
         checkpointer=checkpointer,
+        name="inventory_assistant",
     )
+
+
+_AGENT_BUILDERS = {
+    "inventory_assistant": create_inventory_assistant,
+}
 ```
 
 模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。业务模块不得再次初始化模型。后续生成的 Prompt、工具和业务能力继续在 `src/app/agent/` 与 `src/app/tools/` 内扩展，不在项目根目录建立第二套 Agent 代码树，也不得从请求体读取模型密钥、Provider、用户身份或权限范围。

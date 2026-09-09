@@ -202,41 +202,30 @@ def test_agent_factory_rejects_unknown_agent() -> None:
     assert error.value.code == "agent_not_found"
 
 
-def test_agent_factory_loads_generated_business_agent() -> None:
-    """验证合法业务 Agent ID 会路由到 Build 生成的固定创建入口。"""
+def test_agent_factory_uses_registered_builder() -> None:
+    """验证 Agent 创建只依赖当前应用显式注册的 Builder。"""
+
+    from app.agent import factory
 
     generated_agent = object()
-    generated_factory = Mock(return_value=generated_agent)
-    module = SimpleNamespace(create_agent=generated_factory)
+    generated_builder = Mock(return_value=generated_agent)
     model = object()
+    runtime_context = _context()
     checkpointer = object()
-    context = _context()
-    with patch("app.agent.factory.import_module", return_value=module) as importer:
+    with patch.dict(factory._AGENT_BUILDERS, {"inventory_assistant": generated_builder}):
         agent = create_agent(
             agent_id="inventory_assistant",
             model=model,
-            runtime_context=context,
+            runtime_context=runtime_context,
             checkpointer=checkpointer,
         )
 
     assert agent is generated_agent
-    generated_factory.assert_called_once_with(
+    generated_builder.assert_called_once_with(
         model=model,
-        runtime_context=context,
+        runtime_context=runtime_context,
         checkpointer=checkpointer,
     )
-    importer.assert_called_with("app.agent.inventory_assistant")
-
-
-def test_agent_factory_rejects_generated_module_without_entry() -> None:
-    """验证业务模块缺少固定 create_agent 入口时返回安全错误。"""
-
-    with (
-        patch("app.agent.factory.import_module", return_value=SimpleNamespace()),
-        pytest.raises(RuntimeRequestError) as error,
-    ):
-        validate_agent_id("inventory_assistant")
-    assert error.value.code == "invalid_agent_module"
 
 
 @pytest.mark.asyncio
