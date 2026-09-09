@@ -5,9 +5,7 @@
 ## 目录所有权
 
 ```text
-config/agents/                     平台编译的业务 Agent Definition
-src/app/agent/                     Definition Loader、Generic Factory 与运行上下文
-src/app/extensions/                仅在契约显式需要时生成的 Python Extension
+src/app/agent/                     Agent 创建与运行上下文
 src/app/models/                    多模型初始化
 src/app/tools/                     后续业务工具扩展
 src/app/interaction/               对话、中断与恢复
@@ -86,30 +84,26 @@ curl -N http://127.0.0.1:8010/internal/agents/chat/run \
 
 ## Agent 创建方式
 
-`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，业务 Agent
-则从 `config/agents/<agent_id>.json` 读取完整七类配置，由 Generic Factory 统一调用
-`create_deep_agent`。修改 Prompt、模型参数、Memory、Tools、Skills、Knowledge 或 Context
-只会更新 Definition，不会生成一个新的业务 Agent Python 类。
-
-只有 Definition 无法表达的特殊算法、状态机或 SDK 集成才启用
-`src/app/extensions/<agent_id>.py`，固定入口为：
+`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，并按经过
+`lower_snake_case` 校验的 `agent_id` 加载 Build 生成的 `app.agent.<agent_id>` 模块。
+业务模块必须公开固定入口：
 
 ```python
 from deepagents import create_deep_agent
 
 
-def create_agent(*, definition, model, tools, runtime_context, checkpointer):
-    """实现 Definition 无法表达的特殊能力。"""
+def create_agent(*, model, runtime_context, checkpointer):
+    """使用模板注入的模型、可信上下文和 checkpoint 创建业务智能体。"""
 
     return create_deep_agent(
         model=model,
-        tools=tools,
-        system_prompt=definition.compiled_prompt,
+        tools=[],
+        system_prompt="你是一个代码专家，擅长写 Python 脚本。",
         checkpointer=checkpointer,
     )
 ```
 
-模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。Extension 不得再次初始化模型。标准 Tool 由 Definition 构造；在 Java Tool Gateway 协议尚未完成时保持 `gateway_not_configured` 的 fail-closed 行为，不编造 URL、Header、Token 或成功响应。
+模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。业务模块不得再次初始化模型。后续生成的 Prompt、工具和业务能力继续在 `src/app/agent/` 与 `src/app/tools/` 内扩展，不在项目根目录建立第二套 Agent 代码树，也不得从请求体读取模型密钥、Provider、用户身份或权限范围。
 
 业务 Tool 只允许调用 Agent Contract 已展开的 Java Endpoint。Java 内部地址和服务凭据分别来自 `AGENT_RUNTIME_BACKEND_BASE_URL` 与 `AGENT_RUNTIME_TOOL_GATEWAY_TOKEN`；生成代码只能通过 `RuntimeSettings.require_backend_base_url()` 和 `require_tool_gateway_token()` 读取，不能把值写入源码、Contract、日志或模型输出。用户、租户、Scope 和 Trace 只能从模板校验后的 `RuntimeContext` 转发。
 
