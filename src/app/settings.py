@@ -84,11 +84,25 @@ class RuntimeSettings:
         return self.tool_gateway_token
 
 
-def _positive_int(name: str, default: str) -> int:
+def _configured_value(
+    name: str,
+    fallback_name: str | None,
+    default: str = "",
+) -> str:
+    """按工作区配置、XCodeAgent 托管兜底、默认值的顺序读取配置。"""
+
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    fallback_value = os.getenv(fallback_name, "").strip() if fallback_name else ""
+    return fallback_value or default
+
+
+def _positive_int(name: str, fallback_name: str | None, default: str) -> int:
     """读取正整数环境变量并拒绝零值和非法文本。"""
 
     try:
-        value = int(os.getenv(name, default))
+        value = int(_configured_value(name, fallback_name, default))
     except ValueError:
         raise RuntimeError(f"{name} 必须是正整数。") from None
     if value <= 0:
@@ -96,11 +110,11 @@ def _positive_int(name: str, default: str) -> int:
     return value
 
 
-def _non_negative_int(name: str, default: str) -> int:
+def _non_negative_int(name: str, fallback_name: str | None, default: str) -> int:
     """读取非负整数环境变量并拒绝非法文本。"""
 
     try:
-        value = int(os.getenv(name, default))
+        value = int(_configured_value(name, fallback_name, default))
     except ValueError:
         raise RuntimeError(f"{name} 必须是非负整数。") from None
     if value < 0:
@@ -108,11 +122,11 @@ def _non_negative_int(name: str, default: str) -> int:
     return value
 
 
-def _positive_float(name: str, default: str) -> float:
+def _positive_float(name: str, fallback_name: str | None, default: str) -> float:
     """读取正浮点环境变量并拒绝非正值。"""
 
     try:
-        value = float(os.getenv(name, default))
+        value = float(_configured_value(name, fallback_name, default))
     except ValueError:
         raise RuntimeError(f"{name} 必须是正数。") from None
     if value <= 0:
@@ -131,16 +145,40 @@ def load_settings() -> RuntimeSettings:
     return RuntimeSettings(
         runtime_root=RUNTIME_ROOT,
         host=os.getenv("AGENT_RUNTIME_HOST", "127.0.0.1").strip() or "127.0.0.1",
-        port=_positive_int("AGENT_RUNTIME_PORT", "8010"),
+        port=_positive_int("AGENT_RUNTIME_PORT", None, "8010"),
         gateway_token=os.getenv("AGENT_RUNTIME_GATEWAY_TOKEN", "").strip(),
         working_dir=working_dir.resolve(),
-        model_base_url=os.getenv("MODEL_BASE_URL", "").strip(),
-        model_api_key=os.getenv("MODEL_API_KEY", "").strip(),
-        model_name=os.getenv("MODEL_NAME", "").strip(),
-        model_timeout_seconds=_positive_float("MODEL_TIMEOUT_SECONDS", "120"),
-        model_max_retries=_non_negative_int("MODEL_MAX_RETRIES", "2"),
-        model_temperature=float(os.getenv("AGENT_TEMPERATURE", "0.2")),
-        model_max_tokens=_positive_int("AGENT_MAX_TOKENS", "4096"),
+        model_base_url=_configured_value(
+            "MODEL_BASE_URL", "XCODEAGENT_FALLBACK_MODEL_BASE_URL"
+        ),
+        model_api_key=_configured_value(
+            "MODEL_API_KEY", "XCODEAGENT_FALLBACK_MODEL_API_KEY"
+        ),
+        model_name=_configured_value(
+            "MODEL_NAME", "XCODEAGENT_FALLBACK_MODEL_NAME"
+        ),
+        model_timeout_seconds=_positive_float(
+            "MODEL_TIMEOUT_SECONDS",
+            "XCODEAGENT_FALLBACK_MODEL_TIMEOUT_SECONDS",
+            "120",
+        ),
+        model_max_retries=_non_negative_int(
+            "MODEL_MAX_RETRIES",
+            "XCODEAGENT_FALLBACK_MODEL_MAX_RETRIES",
+            "2",
+        ),
+        model_temperature=float(
+            _configured_value(
+                "AGENT_TEMPERATURE",
+                "XCODEAGENT_FALLBACK_AGENT_TEMPERATURE",
+                "0.2",
+            )
+        ),
+        model_max_tokens=_positive_int(
+            "AGENT_MAX_TOKENS",
+            "XCODEAGENT_FALLBACK_AGENT_MAX_TOKENS",
+            "4096",
+        ),
         backend_base_url=os.getenv("AGENT_RUNTIME_BACKEND_BASE_URL", "").strip(),
         tool_gateway_token=os.getenv("AGENT_RUNTIME_TOOL_GATEWAY_TOKEN", "").strip(),
     )
