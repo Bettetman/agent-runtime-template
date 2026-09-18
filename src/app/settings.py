@@ -4,7 +4,6 @@ import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -15,13 +14,27 @@ load_dotenv(RUNTIME_ROOT / ".env", override=False)
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    """保存模板运行、内部认证、模型和 checkpoint 的当前配置。"""
+    """保存 Direct Runtime 的公开入口、安全、模型和持久化配置。"""
 
     runtime_root: Path
     host: str
     port: int
-    gateway_token: str
     working_dir: Path
+    auth_enabled: bool
+    runtime_profile: str
+    auth_mode: str
+    public_auth_adapter_factory: str
+    mock_token_ttl_seconds: int
+    mock_user_id: str
+    mock_employee_id: str
+    mock_sap_id: str
+    mock_enterprise_id: str
+    anonymous_session_secret: str
+    anonymous_session_ttl_seconds: int
+    anonymous_cookie_name: str
+    cookie_secure: bool
+    allowed_origins: tuple[str, ...]
+    debug_token: str
     model_base_url: str
     model_api_key: str
     model_name: str
@@ -29,8 +42,6 @@ class RuntimeSettings:
     model_max_retries: int
     model_temperature: float
     model_max_tokens: int
-    backend_base_url: str = ""
-    tool_gateway_token: str = ""
 
     @property
     def checkpoint_db_path(self) -> Path:
@@ -38,12 +49,14 @@ class RuntimeSettings:
 
         return self.working_dir / "checkpoints.sqlite"
 
-    def require_gateway_token(self) -> str:
-        """返回内部网关 token，缺失时拒绝开放 Chat。"""
+    def require_anonymous_session_secret(self) -> str:
+        """返回只用于 Auth 关闭场景的匿名会话签名密钥。"""
 
-        if not self.gateway_token:
-            raise RuntimeError("缺少 AGENT_RUNTIME_GATEWAY_TOKEN。")
-        return self.gateway_token
+        if len(self.anonymous_session_secret) < 32:
+            raise RuntimeError(
+                "AGENT_RUNTIME_ANONYMOUS_SESSION_SECRET 至少需要 32 个字符。"
+            )
+        return self.anonymous_session_secret
 
     def require_model(self) -> None:
         """在第一次 Chat 前严格校验项目默认模型配置。"""
@@ -58,30 +71,6 @@ class RuntimeSettings:
         ]
         if missing:
             raise RuntimeError("缺少模型环境变量：" + "、".join(missing) + "。")
-
-    def require_backend_base_url(self) -> str:
-        """返回只含 HTTP(S) Origin 的 Java Backend 内部地址。"""
-
-        value = self.backend_base_url.rstrip("/")
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username
-            or parsed.password
-            or parsed.query
-            or parsed.fragment
-            or parsed.path not in {"", "/"}
-        ):
-            raise RuntimeError("AGENT_RUNTIME_BACKEND_BASE_URL 配置无效。")
-        return value
-
-    def require_tool_gateway_token(self) -> str:
-        """返回 Runtime 调用 Java Tool Gateway 使用的内部凭据。"""
-
-        if not self.tool_gateway_token:
-            raise RuntimeError("缺少 AGENT_RUNTIME_TOOL_GATEWAY_TOKEN。")
-        return self.tool_gateway_token
 
 
 def _configured_value(
@@ -134,6 +123,35 @@ def _positive_float(name: str, fallback_name: str | None, default: str) -> float
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    """读取严格布尔环境变量。"""
+
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"true", "1", "yes", "on"}:
+        return True
+    if normalized in {"false", "0", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} 必须是布尔值。")
+
+
+def _allowed_origins() -> tuple[str, ...]:
+    """读取去重后的 Frontend Origin 白名单。"""
+
+    values = tuple(
+        dict.fromkeys(
+            item.strip().rstrip("/")
+            for item in os.getenv("AGENT_RUNTIME_ALLOWED_ORIGINS", "").split(",")
+            if item.strip()
+        )
+    )
+    if "*" in values:
+        raise RuntimeError("Direct Runtime 不允许通配 CORS Origin。")
+    return values
+
+
 @lru_cache(maxsize=1)
 def load_settings() -> RuntimeSettings:
     """从环境构造一次不可变 Runtime 配置。"""
@@ -146,8 +164,46 @@ def load_settings() -> RuntimeSettings:
         runtime_root=RUNTIME_ROOT,
         host=os.getenv("AGENT_RUNTIME_HOST", "127.0.0.1").strip() or "127.0.0.1",
         port=_positive_int("AGENT_RUNTIME_PORT", None, "8010"),
-        gateway_token=os.getenv("AGENT_RUNTIME_GATEWAY_TOKEN", "").strip(),
         working_dir=working_dir.resolve(),
+        auth_enabled=_boolean("AGENT_RUNTIME_AUTH_ENABLED", False),
+        runtime_profile=(
+            os.getenv("AGENT_RUNTIME_PROFILE", "production").strip().lower()
+            or "production"
+        ),
+        auth_mode=(
+            os.getenv("AGENT_RUNTIME_AUTH_MODE", "enterprise").strip().lower()
+            or "enterprise"
+        ),
+        public_auth_adapter_factory=os.getenv(
+            "AGENT_RUNTIME_PUBLIC_AUTH_ADAPTER_FACTORY", ""
+        ).strip(),
+        mock_token_ttl_seconds=_positive_int(
+            "AGENT_RUNTIME_MOCK_TOKEN_TTL_SECONDS", None, "3600"
+        ),
+        mock_user_id=(
+            os.getenv("AGENT_RUNTIME_MOCK_USER_ID", "local-user").strip()
+            or "local-user"
+        ),
+        mock_employee_id=os.getenv(
+            "AGENT_RUNTIME_MOCK_EMPLOYEE_ID", "local-employee"
+        ).strip(),
+        mock_sap_id=os.getenv("AGENT_RUNTIME_MOCK_SAP_ID", "local-sap").strip(),
+        mock_enterprise_id=os.getenv(
+            "AGENT_RUNTIME_MOCK_ENTERPRISE_ID", "local-enterprise"
+        ).strip(),
+        anonymous_session_secret=os.getenv(
+            "AGENT_RUNTIME_ANONYMOUS_SESSION_SECRET", ""
+        ).strip(),
+        anonymous_session_ttl_seconds=_positive_int(
+            "AGENT_RUNTIME_ANONYMOUS_SESSION_TTL_SECONDS", None, "86400"
+        ),
+        anonymous_cookie_name=(
+            os.getenv("AGENT_RUNTIME_ANONYMOUS_COOKIE_NAME", "agent_runtime_session").strip()
+            or "agent_runtime_session"
+        ),
+        cookie_secure=_boolean("AGENT_RUNTIME_COOKIE_SECURE", False),
+        allowed_origins=_allowed_origins(),
+        debug_token=os.getenv("AGENT_RUNTIME_DEBUG_TOKEN", "").strip(),
         model_base_url=_configured_value(
             "MODEL_BASE_URL", "XCODEAGENT_FALLBACK_MODEL_BASE_URL"
         ),
@@ -179,8 +235,6 @@ def load_settings() -> RuntimeSettings:
             "XCODEAGENT_FALLBACK_AGENT_MAX_TOKENS",
             "4096",
         ),
-        backend_base_url=os.getenv("AGENT_RUNTIME_BACKEND_BASE_URL", "").strip(),
-        tool_gateway_token=os.getenv("AGENT_RUNTIME_TOOL_GATEWAY_TOKEN", "").strip(),
     )
 
 

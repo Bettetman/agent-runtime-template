@@ -1,25 +1,38 @@
-# XCodeAgent Agent Runtime Template
+# XCodeAgent Agent Runtime Direct Template
 
-可独立安装、启动和对话的最小 Python 3.12 + Deep Agents 应用。模板在 `src/app/agent/` 中装配 `chat` Agent，并提供多模型初始化、SQLite checkpoint、可信 Java 网关上下文和 AG-UI SSE Chat；具体业务能力和工具由 XCodeAgent 在 Build DAG 确认后继续生成。
+面向 `agent_runtime_direct` 拓扑的 Python 3.12 + DeepAgents 模板。生成应用只包含 `frontend/` 和 `agent-runtime/`；Frontend 通过公开 AG-UI SSE 直接访问 Runtime，不依赖 Java Backend 或 Gateway。
+
+## 能力边界
+
+- `/agents/{agent_id}/run`：公开 AG-UI SSE；
+- Auth 关闭：Runtime 签发 HttpOnly 匿名会话；
+- Auth 开启：行外 local Profile 使用固定 Mock 用户，行内 production 使用统一认证适配器；
+- thread/checkpoint 按认证模式、可信用户和 Agent 隔离；
+- `/debug/agents/{agent_id}/run`：仅 loopback、固定 Debug Principal；
+- 不创建用户、密码、角色或权限表，不包含 RBAC、Java Endpoint Tool 或数据库业务模型。
+
+`src/app/agent/factory.py` 是唯一 Agent 组合根。模板内置 `chat` 只证明模型、AG-UI、checkpoint 和交互恢复可运行；具体业务 Agent、Runtime-native Tool、Skill 和 Knowledge 仍由 XCodeAgent 在 Build DAG 确认后生成。
 
 ## 目录所有权
 
 ```text
-src/app/agent/                     Agent 创建与运行上下文
-src/app/models/                    多模型初始化
-src/app/tools/                     后续业务工具扩展
-src/app/interaction/               对话、中断与恢复
-src/app/server/                    HTTP 与 AG-UI SSE
-tests/                             Runtime 契约测试
+src/app/agent/          Agent 创建与可信 RuntimeContext
+src/app/security/       一事通适配器合同、local Mock 和匿名会话
+src/app/models/         项目默认模型初始化
+src/app/tools/          Runtime-native Tool 扩展
+src/app/interaction/    对话、中断与恢复
+src/app/persistence/    owner-scoped checkpoint
+src/app/server/         Public Edge、Auth、Debug 和 AG-UI SSE
+tests/                  Runtime 合同测试
 ```
 
-根目录不再额外建立 `agents/` 或 `tools/`。`chat` 只用于保证模板开箱可运行，不代表任何业务 Agent 已完成。模板不预置业务工具、知识库、MCP、插件、Docker、复杂审批或会话管理 API。
+业务 Agent 不得修改 Public Edge、认证适配器、Principal、CORS 或 ownership 基础设施。
 
 ## 本地启动
 
 ```bash
 cp .env.example .env
-# 编辑 .env，至少填写 AGENT_RUNTIME_GATEWAY_TOKEN、MODEL_NAME 和 MODEL_API_KEY。
+# Auth 关闭时设置匿名会话密钥；运行 Agent 前设置 MODEL_NAME 和 MODEL_API_KEY。
 
 uv sync --frozen
 uv run agent-runtime
@@ -31,102 +44,99 @@ uv run agent-runtime
 curl http://127.0.0.1:8010/health
 ```
 
-`/health` 不要求模型凭证，便于模板下载后立即执行 readiness。Chat 会在第一次运行时严格检查模型配置。
+`/health` 不要求模型配置或身份凭据。
 
-## 模型配置
+## 匿名模式
 
-模型统一通过 LangChain `init_chat_model` 初始化，`MODEL_NAME` 使用 `provider:model`：
+保持：
 
-| 模型 | `MODEL_NAME` 示例 | `MODEL_BASE_URL` |
-| --- | --- | --- |
-| DeepSeek | `deepseek:deepseek-chat` | 官方 API 可留空 |
-| GPT | `openai:gpt-4.1-mini` | 官方 API 可留空 |
-| Claude | `anthropic:claude-sonnet-4-5` | 官方 API 可留空 |
-| Qwen | `qwen:qwen-plus` | 填写 DashScope OpenAI 兼容地址 |
-
-也支持 `gpt:`、`claude:`、`qwen:` 这些便于阅读的品牌别名；它们会分别映射为 `openai:`、`anthropic:`、`openai:`。模型名、地址和密钥只能来自运行环境，不能由 Chat 请求覆盖。
-
-## 内部 AG-UI Chat
-
-```http
-POST /internal/agents/{agent_id}/run
-Accept: text/event-stream
-Authorization: Bearer <AGENT_RUNTIME_GATEWAY_TOKEN>
-X-Agent-User-Id: <trusted-user-id>
-X-Agent-Tenant-Id: <trusted-tenant-id>
-X-Agent-Scopes: scope-a,scope-b
+```text
+AGENT_RUNTIME_AUTH_ENABLED=false
 ```
 
-请求体使用 AG-UI `RunAgentInput`。本地独立调试可直接调用模板自带的 `chat` Agent：
+第一次调用 Public AG-UI 时，Runtime 创建不可由客户端选择的匿名 subject，并通过 HttpOnly Cookie 返回会话。后续 thread、run 和 checkpoint 都绑定该 subject。
 
 ```bash
-curl -N http://127.0.0.1:8010/internal/agents/chat/run \
+curl -N -c /tmp/agent-runtime-cookie.txt \
+  http://127.0.0.1:8010/agents/chat/run \
   -H 'Accept: text/event-stream' \
   -H 'Content-Type: application/json' \
-  -H 'Authorization: Bearer replace-with-a-local-gateway-token' \
-  -H 'X-Agent-User-Id: local-user' \
-  -H 'X-Agent-Tenant-Id: local-tenant' \
   --data '{"threadId":"local-thread","runId":"local-run","messages":[{"id":"message-1","role":"user","content":"写一个快速排序"}],"state":{},"tools":[],"context":[],"forwardedProps":{}}'
 ```
 
-接入生成应用后，浏览器不得直连该接口；Java Agent Gateway 校验客户端身份后注入内部认证和可信上下文。
+## 行外本地认证
 
-恢复待交互运行时，通过同一个 endpoint、`agentId` 和 `threadId` 发起新 Run，并在 `forwardedProps` 中提交：
+行外开发需要模拟 Auth 时，使用与 Java Gateway 一致的“接口 + local Mock”模式：
 
-```json
-{
-  "interactionResponse": {
-    "interactionId": "interaction-id-from-state",
-    "value": {}
-  }
-}
+```text
+AGENT_RUNTIME_AUTH_ENABLED=true
+AGENT_RUNTIME_PROFILE=local
+AGENT_RUNTIME_AUTH_MODE=local
 ```
+
+Mock 登录不接收用户名或密码，只为环境变量中的固定用户签发当前进程内的随机令牌：
+
+```http
+POST /_xcode/auth/mock/login
+GET  /_xcode/auth/me
+POST /_xcode/auth/logout
+```
+
+调用 Agent 时携带登录结果中的 Token：
+
+```http
+POST /agents/chat/run
+Authorization: Bearer <accessToken>
+Accept: text/event-stream
+```
+
+local 认证只能在 `AGENT_RUNTIME_PROFILE=local` 下启动，令牌不落库、进程退出即失效，也不能用于生产。
+
+## 行内统一认证
+
+行内部署启用：
+
+```text
+AGENT_RUNTIME_AUTH_ENABLED=true
+AGENT_RUNTIME_PROFILE=production
+AGENT_RUNTIME_AUTH_MODE=enterprise
+AGENT_RUNTIME_PUBLIC_AUTH_ADAPTER_FACTORY=<python-module>:<factory-function>
+```
+
+工厂函数同步接收 `RuntimeSettings`，返回实现 `PublicAuthenticationAdapter` 的对象；其异步 `authenticate(request, bearer_token)` 方法负责调用行内“一事通”，并返回 `XcodePrincipal(user_id, employee_id, sap_id, enterprise_id)` 或 `None`。模板不猜测一事通协议，也不签发生产 Token；实际搬入行内时只需提供该适配器实现。
+
+Auth 只建立可信用户身份，不承载 RBAC。所有 Runtime 资源按可信 `user_id` 与 `enterprise_id` 隔离；Auth 开启后认证失败不会回退为匿名身份。
+
+## 本地调试
+
+XCodeAgent 显式调试启动时注入 `AGENT_RUNTIME_DEBUG_TOKEN`。调试接口固定使用 `xcodeagent-local-debug` Principal，不接受用户、租户或 Scope Header：
+
+```bash
+curl -N http://127.0.0.1:8010/debug/agents/chat/run \
+  -H 'Authorization: Bearer <debug-token>' \
+  -H 'Accept: text/event-stream' \
+  -H 'Content-Type: application/json' \
+  --data '{"threadId":"debug-thread","runId":"debug-run","messages":[{"id":"message-1","role":"user","content":"你好"}],"state":{},"tools":[],"context":[],"forwardedProps":{}}'
+```
+
+调试 Token 不得进入普通预览或生产环境。
+
+## 模型配置
+
+模型统一通过 LangChain `init_chat_model` 初始化。模型名、Base URL 和密钥只来自运行环境，AG-UI 请求不能覆盖。
+
+| 模型 | `MODEL_NAME` 示例 |
+| --- | --- |
+| DeepSeek | `deepseek:deepseek-chat` |
+| GPT | `openai:gpt-4.1-mini` |
+| Claude | `anthropic:claude-sonnet-4-5` |
+| Qwen | `qwen:qwen-plus` |
 
 ## Agent 创建方式
 
-`src/app/agent/factory.py` 是唯一 Agent 组合根。它保留模板内置 `chat`，并通过当前
-应用内的 Builder 注册表解析 `agent_id`，不要求每个业务 Agent 固定生成一个同名文件。
-简单业务 Agent 优先在现有组合根中增加 Builder：
+业务 Agent 继续在 `src/app/agent/factory.py` 的 Builder 注册表中显式注册，并复用模板注入的模型、可信 RuntimeContext 和 checkpointer。未知 Agent ID 返回稳定的 `agent_not_found`。
 
-```python
-from deepagents import create_deep_agent
-
-
-def create_inventory_assistant(*, model, runtime_context, checkpointer):
-    """使用模板注入的能力创建库存助手。"""
-
-    del runtime_context
-    return create_deep_agent(
-        model=model,
-        tools=[],
-        system_prompt="你是库存管理助手，负责查询和解释库存信息。",
-        checkpointer=checkpointer,
-        name="inventory_assistant",
-    )
-
-
-_AGENT_BUILDERS = {
-    "inventory_assistant": create_inventory_assistant,
-}
-```
-
-模板把由 `init_chat_model` 创建的模型、可信上下文和当前 workspace 的 checkpointer 注入工厂。业务模块不得再次初始化模型。后续生成的 Prompt、工具和业务能力继续在 `src/app/agent/` 与 `src/app/tools/` 内扩展，不在项目根目录建立第二套 Agent 代码树，也不得从请求体读取模型密钥、Provider、用户身份或权限范围。
-
-业务 Tool 只允许调用 Agent Contract 已展开的 Java Endpoint。Java 内部地址和服务凭据分别来自 `AGENT_RUNTIME_BACKEND_BASE_URL` 与 `AGENT_RUNTIME_TOOL_GATEWAY_TOKEN`；生成代码只能通过 `RuntimeSettings.require_backend_base_url()` 和 `require_tool_gateway_token()` 读取，不能把值写入源码、Contract、日志或模型输出。用户、租户、Scope 和 Trace 只能从模板校验后的 `RuntimeContext` 转发。
-
-当业务 Agent 需要澄清或确认时，LangGraph interrupt value 必须符合：
-
-```json
-{
-  "schemaVersion": 1,
-  "interactionId": "stable-current-interaction-id",
-  "kind": "clarification",
-  "message": "需要用户补充的信息",
-  "payload": {}
-}
-```
-
-`kind` 支持 `clarification`、`confirmation` 和 `approval_required`。审批决定必须由 Java/平台的正式审批边界产生，Agent Runtime 不能自行批准。
+RuntimeContext 只由统一认证适配器、匿名会话或 Debug 入口建立。业务代码不得从请求体、消息、Header 或 Tool 参数读取自报用户身份。
 
 ## 验证
 

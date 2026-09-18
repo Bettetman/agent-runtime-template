@@ -3,16 +3,24 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, Cookie, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from app.agent.context import RuntimeContextError, create_runtime_context
+from app.agent.context import RuntimeContext, RuntimeContextError
 from app.interaction.schemas import RuntimeRequestError, parse_run_request
 from app.models.factory import close_chat_models
 from app.persistence.checkpointer import close_checkpointers
+from app.security.adapters import (
+    LocalPublicAuthenticationAdapter,
+    PublicAuthenticationAdapter,
+    create_public_authentication_adapter,
+    validate_authentication_settings,
+)
+from app.security.service import resolve_debug_principal, resolve_public_principal
 from app.server.agui import build_agent_runtime_stream
 from app.server.health import router as health_router
-from app.settings import load_settings
+from app.settings import RuntimeSettings, load_settings
 
 
 @asynccontextmanager
@@ -24,50 +32,193 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     await close_chat_models()
 
 
-def create_app() -> FastAPI:
-    """创建只暴露健康检查和内部 AG-UI Chat 的 FastAPI 应用。"""
+def create_app(
+    settings: RuntimeSettings | None = None,
+    authentication_adapter: PublicAuthenticationAdapter | None = None,
+) -> FastAPI:
+    """创建一事通/匿名 Principal 与 AG-UI Direct Edge。"""
 
+    runtime_settings = settings or load_settings()
+    validate_authentication_settings(runtime_settings)
+    public_authentication_adapter = authentication_adapter
+    if runtime_settings.auth_enabled and public_authentication_adapter is None:
+        public_authentication_adapter = create_public_authentication_adapter(
+            runtime_settings
+        )
     application = FastAPI(title="XCodeAgent Agent Runtime", lifespan=lifespan)
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(runtime_settings.allowed_origins),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "traceparent"],
+    )
     application.include_router(health_router)
 
-    @application.post("/internal/agents/{agent_id}/run")
-    async def run_agent(
-        agent_id: str,
-        payload: dict[str, Any] = Body(...),
-        accept: str = Header(default="text/event-stream"),
-        authorization: str = Header(default=""),
-        user_id: str = Header(default="", alias="X-Agent-User-Id"),
-        tenant_id: str = Header(default="", alias="X-Agent-Tenant-Id"),
-        scopes: str = Header(default="", alias="X-Agent-Scopes"),
-        traceparent: str = Header(default=""),
-    ) -> StreamingResponse:
-        """验证 Java 网关上下文并返回业务 Agent AG-UI SSE。"""
+    def bearer_token(authorization: str) -> str:
+        """从标准 Authorization Header 中提取 Bearer Token。"""
 
-        settings = load_settings()
+        scheme, separator, credential = authorization.strip().partition(" ")
+        if separator != " " or scheme.lower() != "bearer" or not credential:
+            return ""
+        return credential
+
+    def principal_payload(context: RuntimeContext) -> dict[str, str | None]:
+        """按 Java XcodePrincipal 的 camelCase 合同返回最小可信身份。"""
+
+        return {
+            "userId": context.user_id,
+            "employeeId": context.employee_id,
+            "sapId": context.sap_id,
+            "enterpriseId": context.enterprise_id,
+        }
+
+    def stream_response(
+        *,
+        agent_id: str,
+        payload: dict[str, Any],
+        runtime_context: RuntimeContext,
+        accept: str,
+        runtime_settings: RuntimeSettings,
+        anonymous_token: str | None = None,
+    ) -> StreamingResponse:
+        """构造 Direct AG-UI 流，并在需要时签发匿名会话 Cookie。"""
+
         try:
-            runtime_context = create_runtime_context(
-                settings=settings,
-                authorization=authorization,
-                user_id=user_id,
-                tenant_id=tenant_id,
-                scopes=scopes,
-                traceparent=traceparent,
-            )
             request = parse_run_request(payload)
-        except RuntimeContextError as exc:
-            raise HTTPException(status_code=401, detail=str(exc)) from exc
         except RuntimeRequestError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        return StreamingResponse(
+        response = StreamingResponse(
             build_agent_runtime_stream(
                 agent_id=agent_id,
                 request=request,
                 runtime_context=runtime_context,
-                settings=settings,
+                settings=runtime_settings,
                 accept=accept,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+        if anonymous_token is not None:
+            response.set_cookie(
+                key=runtime_settings.anonymous_cookie_name,
+                value=anonymous_token,
+                max_age=runtime_settings.anonymous_session_ttl_seconds,
+                httponly=True,
+                secure=runtime_settings.cookie_secure,
+                samesite="lax",
+                path="/",
+            )
+        return response
+
+    if isinstance(public_authentication_adapter, LocalPublicAuthenticationAdapter):
+
+        @application.post("/_xcode/auth/mock/login")
+        async def mock_login() -> dict[str, object]:
+            """为行外本地开发的唯一 Mock 用户签发随机内存令牌。"""
+
+            result = public_authentication_adapter.login()
+            return {
+                "accessToken": result.access_token,
+                "tokenType": "Bearer",
+                "expiresAt": result.expires_at,
+                "user": {
+                    "userId": result.user.user_id,
+                    "employeeId": result.user.employee_id,
+                    "sapId": result.user.sap_id,
+                    "enterpriseId": result.user.enterprise_id,
+                },
+            }
+
+        @application.get("/_xcode/auth/me")
+        async def mock_me(
+            request: Request,
+            authorization: str = Header(default=""),
+            traceparent: str = Header(default=""),
+        ) -> dict[str, object]:
+            """返回当前有效 Mock 会话对应的固定可信用户。"""
+
+            try:
+                resolution = await resolve_public_principal(
+                    settings=runtime_settings,
+                    request=request,
+                    authentication_adapter=public_authentication_adapter,
+                    authorization=authorization,
+                    anonymous_token="",
+                    traceparent=traceparent,
+                )
+            except RuntimeContextError as exc:
+                raise HTTPException(status_code=401, detail=str(exc)) from exc
+            return principal_payload(resolution.context)
+
+        @application.post("/_xcode/auth/logout", status_code=204)
+        async def mock_logout(
+            authorization: str = Header(default=""),
+        ) -> None:
+            """注销当前行外本地 Mock 会话。"""
+
+            public_authentication_adapter.logout(bearer_token(authorization))
+
+    @application.post("/agents/{agent_id}/run")
+    async def run_agent(
+        request: Request,
+        agent_id: str,
+        payload: dict[str, Any] = Body(...),
+        accept: str = Header(default="text/event-stream"),
+        authorization: str = Header(default=""),
+        anonymous_session: str = Cookie(
+            default="", alias=runtime_settings.anonymous_cookie_name
+        ),
+        traceparent: str = Header(default=""),
+    ) -> StreamingResponse:
+        """建立公开 Principal 并返回业务 Agent AG-UI SSE。"""
+
+        try:
+            resolution = await resolve_public_principal(
+                settings=runtime_settings,
+                request=request,
+                authentication_adapter=public_authentication_adapter,
+                authorization=authorization,
+                anonymous_token=anonymous_session,
+                traceparent=traceparent,
+            )
+        except RuntimeContextError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        return stream_response(
+            agent_id=agent_id,
+            payload=payload,
+            runtime_context=resolution.context,
+            accept=accept,
+            runtime_settings=runtime_settings,
+            anonymous_token=resolution.anonymous_token,
+        )
+
+    @application.post("/debug/agents/{agent_id}/run")
+    async def debug_agent(
+        request: Request,
+        agent_id: str,
+        payload: dict[str, Any] = Body(...),
+        accept: str = Header(default="text/event-stream"),
+        authorization: str = Header(default=""),
+        traceparent: str = Header(default=""),
+    ) -> StreamingResponse:
+        """使用固定调试 Principal 提供与生产 namespace 隔离的 loopback 入口。"""
+
+        try:
+            principal = resolve_debug_principal(
+                runtime_settings,
+                authorization=authorization,
+                client_host=request.client.host if request.client else "",
+                traceparent=traceparent,
+            )
+        except RuntimeContextError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        return stream_response(
+            agent_id=agent_id,
+            payload=payload,
+            runtime_context=principal,
+            accept=accept,
+            runtime_settings=runtime_settings,
         )
 
     return application

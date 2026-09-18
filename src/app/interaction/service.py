@@ -36,7 +36,15 @@ InteractionEvent = TextDelta | InteractionOutcome
 def _thread_key(agent_id: str, context: RuntimeContext, thread_id: str) -> str:
     """生成不暴露用户标识且跨进程稳定的 checkpoint 线程键。"""
 
-    identity = "\x1f".join((agent_id, context.tenant_id, context.user_id, thread_id))
+    identity = "\x1f".join(
+        (
+            agent_id,
+            context.authentication_mode,
+            context.enterprise_id or "",
+            context.user_id,
+            thread_id,
+        )
+    )
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -135,8 +143,10 @@ async def stream_agent_interaction(
         "agent_id": agent_id,
         "thread_id": request.thread_id,
         "run_id": request.run_id,
-        "tenant_id": runtime_context.tenant_id,
-        "user_id": runtime_context.user_id,
+        "authentication_mode": runtime_context.authentication_mode,
+        "user_sha256": hashlib.sha256(
+            runtime_context.user_id.encode("utf-8")
+        ).hexdigest(),
     }
     before = _pending_interaction(await _agent_state(agent, config))
     agent_input = _agent_input(request=request, pending=before)
@@ -150,4 +160,3 @@ async def stream_agent_interaction(
         status="awaiting_user" if after is not None else "completed",
         pending_interaction=after,
     )
-

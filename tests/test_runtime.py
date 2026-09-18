@@ -10,13 +10,23 @@ import pytest
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessageChunk
 
-from app.agent.context import RuntimeContext, RuntimeContextError, create_runtime_context
+from app.agent.context import RuntimeContext, RuntimeContextError
 from app.agent.factory import create_agent, validate_agent_id
 from app.interaction.schemas import PendingInteraction, RuntimeRequestError, parse_run_request
-from app.interaction.service import InteractionOutcome, TextDelta, stream_agent_interaction
+from app.interaction.service import (
+    InteractionOutcome,
+    TextDelta,
+    _thread_key,
+    stream_agent_interaction,
+)
 from app.models.factory import close_chat_models, create_chat_model
+from app.security.adapters import XcodePrincipal
+from app.security.service import (
+    resolve_debug_principal,
+    resolve_public_principal,
+)
 from app.server.agui import build_agent_runtime_stream
-from app.server.app import app
+from app.server.app import app, create_app
 from app.settings import RuntimeSettings
 
 
@@ -27,8 +37,22 @@ def _settings(tmp_path, *, model_name: str = "openai:test-model") -> RuntimeSett
         runtime_root=tmp_path,
         host="127.0.0.1",
         port=8010,
-        gateway_token="test-gateway-token",
         working_dir=tmp_path / ".agent-runtime",
+        auth_enabled=False,
+        runtime_profile="production",
+        auth_mode="enterprise",
+        public_auth_adapter_factory="",
+        mock_token_ttl_seconds=3600,
+        mock_user_id="local-user",
+        mock_employee_id="local-employee",
+        mock_sap_id="local-sap",
+        mock_enterprise_id="local-enterprise",
+        anonymous_session_secret="test-session-secret-that-is-long-enough",
+        anonymous_session_ttl_seconds=3600,
+        anonymous_cookie_name="agent_runtime_session",
+        cookie_secure=False,
+        allowed_origins=("http://127.0.0.1:5173",),
+        debug_token="test-debug-token",
         model_base_url="https://example.invalid/v1",
         model_api_key="test-model-token",
         model_name=model_name,
@@ -69,7 +93,11 @@ def _request(*, interaction_response: dict[str, Any] | None = None):
 def _context() -> RuntimeContext:
     """构造隔离线程键使用的可信测试上下文。"""
 
-    return RuntimeContext(user_id="user-1", tenant_id="tenant-1", scopes=("chat",))
+    return RuntimeContext(
+        user_id="user-1",
+        enterprise_id="enterprise-1",
+        authentication_mode="enterprise",
+    )
 
 
 def _decode_frames(stream: str) -> list[dict[str, Any]]:
@@ -91,55 +119,278 @@ def test_health_is_available_without_model_credentials() -> None:
     assert response.json() == {
         "service": "agent-runtime",
         "status": "ok",
-        "protocol": "agent-runtime.v1",
+        "topology": "agent_runtime_direct",
+        "protocol": "agent-runtime-direct.v1",
         "transport": "ag-ui-sse",
     }
 
 
-def test_runtime_context_requires_internal_gateway_token(tmp_path) -> None:
-    """验证伪造或缺失内部网关 token 不能创建可信上下文。"""
+@pytest.mark.asyncio
+async def test_anonymous_session_is_server_issued_and_stable(tmp_path) -> None:
+    """验证匿名 subject 由 Runtime 签发，并能通过受保护 Cookie 恢复。"""
 
     settings = _settings(tmp_path)
-    with pytest.raises(RuntimeContextError):
-        create_runtime_context(
-            settings=settings,
-            authorization="Bearer wrong",
-            user_id="user-1",
-            tenant_id="tenant-1",
+    created = await resolve_public_principal(
+        settings,
+        request=Mock(),
+        authentication_adapter=None,
+        authorization="",
+        anonymous_token="",
+    )
+    assert created.context.authentication_mode == "anonymous"
+    assert created.anonymous_token
+
+    restored = await resolve_public_principal(
+        settings,
+        request=Mock(),
+        authentication_adapter=None,
+        authorization="",
+        anonymous_token=created.anonymous_token or "",
+    )
+    assert restored.anonymous_token is None
+    assert restored.context.user_id == created.context.user_id
+
+
+@pytest.mark.asyncio
+async def test_enterprise_adapter_builds_xcode_principal(tmp_path) -> None:
+    """验证 Auth 只消费一事通适配器身份，不创建 Runtime 用户或访问令牌。"""
+
+    settings = replace(_settings(tmp_path), auth_enabled=True)
+
+    class FakeEnterpriseAdapter:
+        """模拟行内适配器返回标准 XcodePrincipal。"""
+
+        async def authenticate(self, _request, bearer_token):
+            """只接受测试用统一认证凭据。"""
+
+            if bearer_token != "enterprise-token":
+                return None
+            return XcodePrincipal(
+                user_id="user-1001",
+                employee_id="employee-1001",
+                sap_id="sap-1001",
+                enterprise_id="enterprise-1",
+            )
+
+    principal = (
+        await resolve_public_principal(
+            settings,
+            request=Mock(),
+            authentication_adapter=FakeEnterpriseAdapter(),
+            authorization="Bearer enterprise-token",
+            anonymous_token="",
         )
-    context = create_runtime_context(
-        settings=settings,
-        authorization="Bearer test-gateway-token",
-        user_id="user-1",
-        tenant_id="tenant-1",
-        scopes="chat,chat,inventory",
+    ).context
+    assert principal.user_id == "user-1001"
+    assert principal.employee_id == "employee-1001"
+    assert principal.sap_id == "sap-1001"
+    assert principal.enterprise_id == "enterprise-1"
+    assert principal.authentication_mode == "enterprise"
+
+    with pytest.raises(RuntimeContextError):
+        await resolve_public_principal(
+            settings,
+            request=Mock(),
+            authentication_adapter=FakeEnterpriseAdapter(),
+            authorization="Bearer invalid",
+            anonymous_token="",
+        )
+
+
+def test_auth_enabled_requires_enterprise_adapter(tmp_path) -> None:
+    """验证 Auth 开启但未接入一事通工厂时服务严格拒绝启动。"""
+
+    settings = replace(_settings(tmp_path), auth_enabled=True)
+    with pytest.raises(RuntimeError, match="PUBLIC_AUTH_ADAPTER_FACTORY"):
+        create_app(settings)
+
+
+def test_local_auth_uses_fixed_mock_user_and_memory_token(tmp_path) -> None:
+    """验证行外 local 模式不收账号密码、不建表，并可注销内存令牌。"""
+
+    settings = replace(
+        _settings(tmp_path),
+        auth_enabled=True,
+        runtime_profile="local",
+        auth_mode="local",
     )
-    assert context.scopes == ("chat", "inventory")
+    with TestClient(create_app(settings)) as client:
+        login = client.post("/_xcode/auth/mock/login")
+        assert login.status_code == 200
+        assert login.json()["user"]["userId"] == "local-user"
+        token = login.json()["accessToken"]
+
+        current = client.get(
+            "/_xcode/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert current.status_code == 200
+        assert current.json()["userId"] == "local-user"
+
+        logout = client.post(
+            "/_xcode/auth/logout",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert logout.status_code == 204
+        rejected = client.get(
+            "/_xcode/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert rejected.status_code == 401
 
 
-def test_tool_gateway_settings_require_safe_origin_and_token(tmp_path) -> None:
-    """验证业务 Tool 只能读取安全 Java Origin 和独立内部凭据。"""
+def test_local_auth_is_rejected_outside_local_profile(tmp_path) -> None:
+    """验证 Mock 认证不能在非 local Profile 下启动。"""
+
+    settings = replace(
+        _settings(tmp_path),
+        auth_enabled=True,
+        auth_mode="local",
+        runtime_profile="production",
+    )
+    with pytest.raises(RuntimeError, match="PROFILE=local"):
+        create_app(settings)
+
+
+@pytest.mark.asyncio
+async def test_public_agent_route_uses_enterprise_adapter(tmp_path) -> None:
+    """验证公开 Agent 请求把 Bearer 交给适配器并使用可信用户身份。"""
+
+    settings = replace(_settings(tmp_path), auth_enabled=True)
+
+    class FakeEnterpriseAdapter:
+        """记录公开入口传入的 Bearer，并返回测试用户。"""
+
+        def __init__(self):
+            """初始化凭据记录。"""
+
+            self.bearer_token = ""
+
+        async def authenticate(self, _request, bearer_token):
+            """记录 Bearer 并返回可信身份。"""
+
+            self.bearer_token = bearer_token
+            return XcodePrincipal(user_id="user-1001", enterprise_id="enterprise-1")
+
+    async def fake_stream(**_kwargs):
+        """返回最小 SSE 帧以隔离模型和 Agent 执行。"""
+
+        yield "data: {}\n\n"
+
+    adapter = FakeEnterpriseAdapter()
+    stream_builder = Mock(side_effect=fake_stream)
+    with (
+        patch("app.server.app.build_agent_runtime_stream", new=stream_builder),
+        TestClient(create_app(settings, adapter)) as client,
+    ):
+        response = client.post(
+            "/agents/chat/run",
+            headers={
+                "Accept": "text/event-stream",
+                "Authorization": "Bearer enterprise-token",
+            },
+            json={
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "messages": [
+                    {"id": "message-1", "role": "user", "content": "你好"}
+                ],
+                "state": {},
+                "tools": [],
+                "context": [],
+                "forwardedProps": {},
+            },
+        )
+
+    assert response.status_code == 200
+    assert adapter.bearer_token == "enterprise-token"
+    assert stream_builder.call_args.kwargs["runtime_context"].user_id == "user-1001"
+
+
+@pytest.mark.asyncio
+async def test_enterprise_adapter_rejects_missing_bearer(tmp_path) -> None:
+    """验证 Auth 模式不会回退到匿名身份。"""
+
+    settings = replace(_settings(tmp_path), auth_enabled=True)
+    with pytest.raises(RuntimeContextError):
+        await resolve_public_principal(
+            settings,
+            request=Mock(),
+            authentication_adapter=AsyncMock(),
+            authorization="",
+            anonymous_token="",
+        )
+
+
+def test_debug_principal_cannot_be_selected_by_headers(tmp_path) -> None:
+    """验证 Debug Token 只建立固定 Principal，且非 loopback 请求被拒绝。"""
 
     settings = _settings(tmp_path)
-    with pytest.raises(RuntimeError, match="BACKEND_BASE_URL"):
-        settings.require_backend_base_url()
-    with pytest.raises(RuntimeError, match="TOOL_GATEWAY_TOKEN"):
-        settings.require_tool_gateway_token()
-
-    configured = replace(
+    context = resolve_debug_principal(
         settings,
-        backend_base_url="http://127.0.0.1:8080/",
-        tool_gateway_token="tool-token",
+        authorization="Bearer test-debug-token",
+        client_host="127.0.0.1",
     )
-    assert configured.require_backend_base_url() == "http://127.0.0.1:8080"
-    assert configured.require_tool_gateway_token() == "tool-token"
+    assert context.user_id == "xcodeagent-local-debug"
+    assert context.authentication_mode == "debug"
+    with pytest.raises(RuntimeContextError):
+        resolve_debug_principal(
+            settings,
+            authorization="Bearer test-debug-token",
+            client_host="192.0.2.10",
+        )
 
-    unsafe = replace(
-        settings,
-        backend_base_url="https://user:password@example.com/api",
+
+def test_checkpoint_thread_key_isolated_by_principal() -> None:
+    """验证相同 Agent/thread 在不同 subject 下使用不同 checkpoint key。"""
+
+    first = _context()
+    second = first.model_copy(update={"user_id": "user-2"})
+    assert _thread_key("chat", first, "thread-1") == _thread_key(
+        "chat", first, "thread-1"
     )
-    with pytest.raises(RuntimeError, match="BACKEND_BASE_URL"):
-        unsafe.require_backend_base_url()
+    assert _thread_key("chat", first, "thread-1") != _thread_key(
+        "chat", second, "thread-1"
+    )
+
+
+def test_public_agent_route_issues_anonymous_session(tmp_path) -> None:
+    """验证 Public Edge 不依赖 Gateway Header，并签发服务器匿名会话。"""
+
+    settings = _settings(tmp_path)
+
+    async def fake_stream(**_kwargs):
+        """返回最小 SSE 帧以隔离模型和 Agent 执行。"""
+
+        yield "data: {}\n\n"
+
+    stream_builder = Mock(side_effect=fake_stream)
+    with (
+        patch("app.server.app.build_agent_runtime_stream", new=stream_builder),
+        TestClient(create_app(settings)) as client,
+    ):
+        response = client.post(
+            "/agents/chat/run",
+            headers={"Accept": "text/event-stream"},
+            json={
+                "threadId": "thread-1",
+                "runId": "run-1",
+                "messages": [
+                    {"id": "message-1", "role": "user", "content": "你好"}
+                ],
+                "state": {},
+                "tools": [],
+                "context": [],
+                "forwardedProps": {},
+            },
+        )
+
+    assert response.status_code == 200
+    assert "agent_runtime_session=" in response.headers["set-cookie"]
+    assert (
+        stream_builder.call_args.kwargs["runtime_context"].authentication_mode
+        == "anonymous"
+    )
 
 
 @pytest.mark.asyncio

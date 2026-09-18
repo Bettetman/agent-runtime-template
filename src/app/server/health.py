@@ -13,7 +13,7 @@ async def health() -> dict[str, object]:
     return {
         "service": "agent-runtime",
         "status": "ok",
-        "protocol": "agent-runtime.v1",
+        "topology": "agent_runtime_direct",
+        "protocol": "agent-runtime-direct.v1",
         "transport": "ag-ui-sse",
     }
-

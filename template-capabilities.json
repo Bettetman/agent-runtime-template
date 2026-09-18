@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "topology": "agent_runtime_direct",
+  "capabilities": {
+    "agent_runtime_public_edge": {
+      "entrypoint": "src/app/server/app.py",
+      "contractTests": ["test_public_agent_route_issues_anonymous_session"]
+    },
+    "agent_runtime_public_auth": {
+      "entrypoint": "src/app/security/adapters.py",
+      "contractTests": [
+        "test_enterprise_adapter_builds_xcode_principal",
+        "test_auth_enabled_requires_enterprise_adapter",
+        "test_public_agent_route_uses_enterprise_adapter",
+        "test_local_auth_uses_fixed_mock_user_and_memory_token",
+        "test_local_auth_is_rejected_outside_local_profile"
+      ]
+    },
+    "agent_runtime_anonymous_session": {
+      "entrypoint": "src/app/security/tokens.py",
+      "contractTests": ["test_anonymous_session_is_server_issued_and_stable"]
+    },
+    "agent_runtime_principal_ownership": {
+      "entrypoint": "src/app/interaction/service.py",
+      "contractTests": ["test_checkpoint_thread_key_isolated_by_principal"]
+    },
+    "agent_runtime_local_debug": {
+      "entrypoint": "src/app/security/service.py",
+      "contractTests": ["test_debug_principal_cannot_be_selected_by_headers"]
+    }
+  }
+}
