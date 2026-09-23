@@ -2,6 +2,22 @@
   "schemaVersion": 1,
   "topology": "agent_runtime_direct",
   "capabilities": {
+    "python_application_runtime": {
+      "entrypoint": "src/app/server/app.py",
+      "contractTests": ["test_business_router_is_mounted_with_trusted_principal"]
+    },
+    "python_business_api": {
+      "entrypoint": "src/app/api/router.py",
+      "contractTests": ["test_business_router_is_mounted_with_trusted_principal"]
+    },
+    "python_domain_model": {
+      "entrypoint": "src/app/domain/base.py",
+      "contractTests": ["test_business_entity_rejects_undeclared_fields"]
+    },
+    "python_repository": {
+      "entrypoint": "src/app/infrastructure/database.py",
+      "contractTests": ["test_business_database_is_separate_and_rolls_back"]
+    },
     "agent_runtime_public_edge": {
       "entrypoint": "src/app/server/app.py",
       "contractTests": ["test_public_agent_route_issues_anonymous_session"]

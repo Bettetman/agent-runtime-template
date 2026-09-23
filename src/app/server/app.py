@@ -7,7 +7,9 @@ from fastapi import Body, Cookie, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+from app.api.router import business_router
 from app.agent.context import RuntimeContext, RuntimeContextError
+from app.infrastructure.database import BusinessDatabase
 from app.interaction.schemas import RuntimeRequestError, parse_run_request
 from app.models.factory import close_chat_models
 from app.persistence.checkpointer import close_checkpointers
@@ -46,6 +48,11 @@ def create_app(
             runtime_settings
         )
     application = FastAPI(title="XCodeAgent Agent Runtime", lifespan=lifespan)
+    application.state.runtime_settings = runtime_settings
+    application.state.public_authentication_adapter = public_authentication_adapter
+    application.state.business_database = BusinessDatabase(
+        runtime_settings.resolved_business_database_path
+    )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(runtime_settings.allowed_origins),
@@ -54,6 +61,7 @@ def create_app(
         allow_headers=["Authorization", "Content-Type", "traceparent"],
     )
     application.include_router(health_router)
+    application.include_router(business_router)
 
     def bearer_token(authorization: str) -> str:
         """从标准 Authorization Header 中提取 Bearer Token。"""

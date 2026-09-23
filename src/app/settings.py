@@ -42,12 +42,22 @@ class RuntimeSettings:
     model_max_retries: int
     model_temperature: float
     model_max_tokens: int
+    business_database_path: str = ".business-data/business.sqlite"
 
     @property
     def checkpoint_db_path(self) -> Path:
         """返回当前 Runtime 独占的 SQLite checkpoint 文件路径。"""
 
         return self.working_dir / "checkpoints.sqlite"
+
+    @property
+    def resolved_business_database_path(self) -> Path:
+        """返回独立于 Agent checkpoint 的业务数据库文件位置。"""
+
+        path = Path(self.business_database_path).expanduser()
+        if not path.is_absolute():
+            path = self.runtime_root / path
+        return path.resolve()
 
     def require_anonymous_session_secret(self) -> str:
         """返回只用于 Auth 关闭场景的匿名会话签名密钥。"""
@@ -234,6 +244,10 @@ def load_settings() -> RuntimeSettings:
             "AGENT_MAX_TOKENS",
             "XCODEAGENT_FALLBACK_AGENT_MAX_TOKENS",
             "4096",
+        ),
+        business_database_path=(
+            os.getenv("BUSINESS_DATABASE_PATH", ".business-data/business.sqlite").strip()
+            or ".business-data/business.sqlite"
         ),
     )
 
